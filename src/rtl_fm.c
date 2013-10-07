@@ -118,6 +118,20 @@ struct fm_state
 	int      prev_lpr_index;
 	int      dc_block, dc_avg;
 	void     (*mode_demod)(struct fm_state*);
+        float    agc_gain;
+        float    agc_attack_rate;
+        float    agc_decay_rate;
+        float    agc_reference;
+        float    agc_max_gain;
+        int      num_agc_gain_samples;
+        float    *gain_samples;
+        int      gain_sample_idx;
+        int      agc_enabled;
+        float    agc_post_gain;
+        float    current_gain;
+        long long last_agc_update;
+        int      agc_update_interval;
+
 };
 
 void usage(void)
@@ -547,9 +561,38 @@ int post_squelch(struct fm_state *fm)
 	return 0;
 }
 
+void post_agc(struct fm_state *fm)
+{
+  int i=0;
+  for (i=0; i < fm->signal2_len; i++) {
+    float output = fm->signal2[i] * fm->agc_gain;
+    float tmp = fabsf(output) - fm->agc_reference;
+    float rate = fm->agc_decay_rate;
+    if(fabs(tmp)>fm->agc_gain) {
+      rate = fm->agc_attack_rate;
+    }
+    fm->agc_gain -= tmp * rate;
+
+    if(fm->agc_gain < 0.0)
+      fm->agc_gain = 0.250f;
+    if(fm->agc_max_gain > 0.0 && fm->agc_gain > fm->agc_max_gain) {
+      fm->agc_gain = fm->agc_max_gain;
+    }
+
+    fm->signal2[i] = fm->signal2[i] * (fm->current_gain * fm->agc_post_gain);
+    fm->gain_samples[fm->gain_sample_idx%fm->num_agc_gain_samples] = fm->agc_gain;
+    fm->gain_sample_idx++;
+  }
+
+  if(fm->agc_gain > fm->squelch_level)
+    fm->squelch_hits++;
+  else
+    fm->squelch_hits = 0;
+}
+
 static void optimal_settings(struct fm_state *fm, int freq, int hopping)
 {
-	int r, capture_freq, capture_rate;
+  int r, capture_freq, capture_rate,i;
 	fm->downsample = (1000000 / fm->sample_rate) + 1;
 	fm->freq_now = freq;
 	capture_rate = fm->downsample * fm->sample_rate;
@@ -588,6 +631,7 @@ static void optimal_settings(struct fm_state *fm, int freq, int hopping)
 void full_demod(struct fm_state *fm)
 {
 	int i, sr, freq_next, hop = 0;
+	int muted = 0;
 	pthread_rwlock_wrlock(&data_rw);
 	rotate_90(fm->buf, fm->buf_len);
 	if (fm->fir_enable) {
@@ -601,17 +645,37 @@ void full_demod(struct fm_state *fm)
 		fwrite(fm->signal2, 2, fm->signal2_len, fm->file);
 		return;
 	}
-	sr = post_squelch(fm);
-	if (!sr && fm->squelch_hits > fm->conseq_squelch) {
-		if (fm->terminate_on_squelch) {
-			fm->exit_flag = 1;}
-		if (fm->freq_len == 1) {  /* mute */
-			for (i=0; i<fm->signal_len; i++) {
-				fm->signal2[i] = 0;}
-		}
-		else {
-			hop = 1;}
+
+	if(fm->agc_enabled) {
+	  post_agc(fm);
+	  if(fm->squelch_level && fm->squelch_hits > fm->conseq_squelch && fm->agc_gain > fm->squelch_level) {
+	    if (fm->terminate_on_squelch) {
+	      fm->exit_flag = 1;}
+	    if (fm->freq_len == 1) {  /* mute */
+	      muted = 1;
+	      for (i=0; i<fm->signal2_len; i++) {
+		fm->signal2[i] = 0;}
+	    }
+	    else {
+	      hop = 1;}
+	  }
 	}
+	else {
+	  // old agc
+	  sr = post_squelch(fm);
+	  if (!sr && fm->squelch_hits > fm->conseq_squelch) {
+	    if (fm->terminate_on_squelch) {
+	      fm->exit_flag = 1;}
+	    if (fm->freq_len == 1) {  /* mute */
+	      for (i=0; i<fm->signal_len; i++) {
+		fm->signal2[i] = 0;}
+	    }
+	    else {
+	      hop = 1;
+	    }
+	  }
+	}
+
 	if (fm->post_downsample > 1) {
 		fm->signal2_len = low_pass_simple(fm->signal2, fm->signal2_len, fm->post_downsample);}
 	if (fm->output_rate > 0) {
@@ -630,6 +694,12 @@ void full_demod(struct fm_state *fm)
 		/* wait for settling and flush buffer */
 		usleep(5000);
 		rtlsdr_read_sync(dev, NULL, 4096, NULL);
+	}
+	fm->num_agc_gain_samples = fm->sample_rate/1000;
+	free(fm->gain_samples);
+	fm->gain_samples = malloc(sizeof(float)*fm->num_agc_gain_samples);
+	for(i=0;i<fm->num_agc_gain_samples;i++) {
+	  fm->gain_samples[i] = 1;
 	}
 }
 
@@ -722,6 +792,7 @@ void frequency_range(struct fm_state *fm, char *arg)
 
 void fm_init(struct fm_state *fm)
 {
+        int i = 0; 
 	fm->freqs[0] = 100000000;
 	fm->sample_rate = DEFAULT_SAMPLE_RATE;
 	fm->squelch_level = 0;
@@ -743,6 +814,22 @@ void fm_init(struct fm_state *fm)
 	fm->now_lpr = 0;
 	fm->dc_block = 0;
 	fm->dc_avg = 0;
+	fm->agc_gain = 1;
+	fm->agc_attack_rate = 6.25E-4;
+	fm->agc_decay_rate = 1e-5;
+	fm->agc_reference = 8192;
+	fm->agc_max_gain = 65535;
+	fm->last_agc_update = 0;
+	fm->agc_post_gain = 1.25f;
+	fm->current_gain = 1;
+	fm->agc_enabled = 1;
+	fm->gain_sample_idx = 0;
+	fm->agc_update_interval = 100;
+	fm->num_agc_gain_samples = fm->sample_rate/1000;
+	fm->gain_samples = malloc(sizeof(float)*fm->num_agc_gain_samples);
+	for(i=0;i<fm->num_agc_gain_samples;i++) {
+	  fm->gain_samples[i] = 1;
+	}
 }
 
 int main(int argc, char **argv)
